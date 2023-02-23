@@ -30,7 +30,7 @@ CREATE FOREIGN TABLE IF NOT EXISTS db721_farm
     max_age_weeks   real
 ) SERVER db721_server OPTIONS
 (
-    filename '/home/kapi/git/postgres/data-farms.db721',
+    filename '/home/aabedon/postgres-cmudb-p1/data-farms.db721',
     tablename 'Farm'
 );
 CREATE FOREIGN TABLE IF NOT EXISTS db721_chicken (
@@ -43,6 +43,6 @@ CREATE FOREIGN TABLE IF NOT EXISTS db721_chicken (
     notes           varchar
 ) SERVER db721_server OPTIONS
 (
-    filename '/home/kapi/git/postgres/data-chickens.db721',
+    filename '/home/aabedon/postgres-cmudb-p1/data-chickens.db721',
     tablename 'Chicken'
 );
