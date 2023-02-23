@@ -39,19 +39,12 @@ int
 <=
 <>
 */
-#define OP_INT_EQ_L 96
-#define OP_INT_GT_L 521
-#define OP_INT_GTE_L 525
-#define OP_INT_LT_L 97
-#define OP_INT_LTE_L 523
-#define OP_INT_NEQ_L 518
-
-#define OP_INT_EQ_R 96
-#define OP_INT_GT_R 521
-#define OP_INT_GTE_R 525
-#define OP_INT_LT_R 97
-#define OP_INT_LTE_R 523
-#define OP_INT_NEQ_R 518
+#define OP_INT_EQ_LR 96
+#define OP_INT_GT_LR 521
+#define OP_INT_GTE_LR 525
+#define OP_INT_LT_LR 97
+#define OP_INT_LTE_LR 523
+#define OP_INT_NEQ_LR 518
 
 /*
 float
@@ -85,19 +78,12 @@ str
 <= 
 <> 
 */
-#define OP_STR_EQ_L 98
-#define OP_STR_GT_L 666
-#define OP_STR_GTE_L 667
-#define OP_STR_LT_L 664
-#define OP_STR_LTE_L 665
-#define OP_STR_NEQ_L 531
-
-#define OP_STR_EQ_R 98
-#define OP_STR_GT_R 666
-#define OP_STR_GTE_R 667
-#define OP_STR_LT_R 664
-#define OP_STR_LTE_R 665
-#define OP_STR_NEQ_R 531
+#define OP_STR_EQ_LR 98
+#define OP_STR_GT_LR 666
+#define OP_STR_GTE_LR 667
+#define OP_STR_LT_LR 664
+#define OP_STR_LTE_LR 665
+#define OP_STR_NEQ_LR 531
 
 
 #define METADATA_SIZE_OFFSET 4
@@ -106,6 +92,8 @@ str
 
 // clang-format on
 using json = nlohmann::json;
+
+std::locale loc("en_US.UTF-8");
 
 typedef struct BlockBuffer
 {
@@ -448,7 +436,6 @@ db721_BeginRead(const char *filename, TupleDesc tupleDescriptor,
   readstate->blockNext = 0;
 
   readstate->overallRow = 0;
-
   return readstate;
 }
 
@@ -604,17 +591,17 @@ bool evaluate_op(Oid opno, Datum left, Datum right, int type)
     int right_int = DatumGetInt32(right);
     switch (opno)
     {
-    case OP_INT_LT_L: // <
+    case OP_INT_LT_LR: // <
       return left_int < right_int;
-    case OP_INT_LTE_L: // <=
+    case OP_INT_LTE_LR: // <=
       return left_int <= right_int;
-    case OP_INT_EQ_L: // =
+    case OP_INT_EQ_LR: // =
       return left_int == right_int;
-    case OP_INT_GTE_L: // >=
+    case OP_INT_GTE_LR: // >=
       return left_int >= right_int;
-    case OP_INT_GT_L: // >
+    case OP_INT_GT_LR: // >
       return left_int > right_int;
-    case OP_INT_NEQ_L: // <>
+    case OP_INT_NEQ_LR: // <>
       return left_int != right_int;
     default:
       elog(ERROR, "unknown opno %u", opno);
@@ -675,24 +662,23 @@ bool evaluate_op(Oid opno, Datum left, Datum right, int type)
   }
   else if (type == TYPE_STR)
   {
-    std::locale loc;
     char *tl = DatumGetPointer(left);
     char *tr = DatumGetPointer(right);
     std::string left_text(VARDATA(tl), VARSIZE(tl) - VARHDRSZ);
     std::string right_text(VARDATA(tr), VARSIZE(tr) - VARHDRSZ);
     switch (opno)
     {
-    case OP_STR_LT_L: // <
+    case OP_STR_LT_LR: // <
       return loc(left_text, right_text);
-    case OP_STR_LTE_L: // <=
+    case OP_STR_LTE_LR: // <=
       return left_text == right_text || loc(left_text, right_text);
-    case OP_STR_EQ_L: // =
+    case OP_STR_EQ_LR: // =
       return left_text == right_text;
-    case OP_STR_GTE_L: // >=
+    case OP_STR_GTE_LR: // >=
       return left_text == right_text || loc(right_text, left_text);
-    case OP_STR_GT_L: // >
+    case OP_STR_GT_LR: // >
       return loc(right_text, left_text);
-    case OP_STR_NEQ_L: // <>
+    case OP_STR_NEQ_LR: // <>
       return left_text != right_text;
     default:
       elog(ERROR, "unknown opno %u", opno);
