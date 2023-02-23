@@ -3,6 +3,7 @@
 
 #include "dog.h"
 #include "nlohmann/json.hpp"
+#include <locale>
 
 // clang-format off
 extern "C" {
@@ -25,6 +26,80 @@ extern "C" {
 #include <sys/stat.h>
 }
 
+#define TYPE_INT 1
+#define TYPE_FLOAT 2
+#define TYPE_STR 3
+
+/* 
+int
+= 
+> 
+>=
+< 
+<=
+<>
+*/
+#define OP_INT_EQ_L 96
+#define OP_INT_GT_L 521
+#define OP_INT_GTE_L 525
+#define OP_INT_LT_L 97
+#define OP_INT_LTE_L 523
+#define OP_INT_NEQ_L 518
+
+#define OP_INT_EQ_R 96
+#define OP_INT_GT_R 521
+#define OP_INT_GTE_R 525
+#define OP_INT_LT_R 97
+#define OP_INT_LTE_R 523
+#define OP_INT_NEQ_R 518
+
+/*
+float
+=  
+>  
+>= 
+<  
+<= 
+<> 
+*/
+#define OP_FLOAT_EQ_L 1120
+#define OP_FLOAT_GT_L 1123
+#define OP_FLOAT_GTE_L 1125
+#define OP_FLOAT_LT_L 1122
+#define OP_FLOAT_LTE_L 1124
+#define OP_FLOAT_NEQ_L 1121
+
+#define OP_FLOAT_EQ_R 1130
+#define OP_FLOAT_GT_R 1133
+#define OP_FLOAT_GTE_R 1135
+#define OP_FLOAT_LT_R 1132
+#define OP_FLOAT_LTE_R 1134
+#define OP_FLOAT_NEQ_R 1131
+
+/*
+str
+=  
+>  
+>= 
+<  
+<= 
+<> 
+*/
+#define OP_STR_EQ_L 98
+#define OP_STR_GT_L 666
+#define OP_STR_GTE_L 667
+#define OP_STR_LT_L 664
+#define OP_STR_LTE_L 665
+#define OP_STR_NEQ_L 531
+
+#define OP_STR_EQ_R 98
+#define OP_STR_GT_R 666
+#define OP_STR_GTE_R 667
+#define OP_STR_LT_R 664
+#define OP_STR_LTE_R 665
+#define OP_STR_NEQ_R 531
+
+
 #define METADATA_SIZE_OFFSET 4
 #define STR_SIZE 32
 #define INT_FLOAT_SIZE 4
@@ -36,6 +111,7 @@ typedef struct BlockBuffer
 {
   Datum *values;
   char *valueBuffer;
+  int type;
 } BlockBuffer;
 
 typedef struct TableReadState
@@ -151,12 +227,6 @@ static json GetMetadata(FILE *tableFile, const char *filename)
   json metadata;
   struct stat st;
 
-  if (tableFile == NULL)
-  {
-    ereport(ERROR, (errcode_for_file_access(),
-                    errmsg("could not open file \"%s\" for reading: %m", filename)));
-  }
-
   if (stat(filename, &st) < 0)
   {
     ereport(ERROR, (errcode_for_file_access(),
@@ -165,12 +235,6 @@ static json GetMetadata(FILE *tableFile, const char *filename)
 
   metadataSizeBytes = ReadFromFile(tableFile, st.st_size - METADATA_SIZE_OFFSET, METADATA_SIZE_OFFSET);
   metadataSize = *((uint32_t *)metadataSizeBytes->data);
-
-  if (tableFile == NULL)
-  {
-    ereport(ERROR, (errcode_for_file_access(),
-                    errmsg("could not open file \"%s\" for reading: %m", filename)));
-  }
 
   metadataBytes = ReadFromFile(tableFile, st.st_size - METADATA_SIZE_OFFSET - metadataSize, metadataSize);
 
@@ -357,9 +421,24 @@ db721_BeginRead(const char *filename, TupleDesc tupleDescriptor,
     if (attr_type == "str")
     {
       readstate->blockBuffers[projectedColumnIndex].valueBuffer = (char *)palloc(max_block_size * (STR_SIZE + VARHDRSZ));
+      readstate->blockBuffers[projectedColumnIndex].type = TYPE_STR;
     }
     else
     {
+      if (attr_type == "int")
+      {
+        readstate->blockBuffers[projectedColumnIndex].type = TYPE_INT;
+      }
+      else if (attr_type == "float")
+      {
+        readstate->blockBuffers[projectedColumnIndex].type = TYPE_FLOAT;
+      }
+      else
+      {
+        ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
+                        errmsg("unsupported type %s", attr_type.c_str())));
+      }
+
       readstate->blockBuffers[projectedColumnIndex].valueBuffer = NULL;
     }
   }
@@ -376,26 +455,6 @@ db721_BeginRead(const char *filename, TupleDesc tupleDescriptor,
 void db721_EndRead(TableReadState *readstate)
 {
   FreeFile(readstate->tableFile);
-
-  // ListCell *projectedColumnCell = NULL;
-  // foreach (projectedColumnCell, readstate->projectedColumnList)
-  // {
-  //   Var *projectedColumn = (Var *)lfirst(projectedColumnCell);
-  //   uint32 projectedColumnIndex = projectedColumn->varattno - 1;
-  //   if (readstate->blockBuffers[projectedColumnIndex].values)
-  //   {
-  //     elog(LOG, "freeing values %d", projectedColumnIndex);
-  //     free(readstate->blockBuffers[projectedColumnIndex].values);
-  //   }
-  //   if (readstate->blockBuffers[projectedColumnIndex].valueBuffer)
-  //   {
-  //     elog(LOG, "freeing value buffer %d", projectedColumnIndex);
-  //     free(readstate->blockBuffers[projectedColumnIndex].valueBuffer);
-  //   }
-  // }
-  // pfree(readstate->blockBuffers);
-
-  // pfree(readstate);
 }
 
 extern "C" void db721_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
@@ -437,6 +496,9 @@ db721_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
   ForeignScan *foreignScan = NULL;
   List *columnList = NIL;
   List *foreignPrivateList = NIL;
+  List *actual_scan_clauses = NIL;
+  List *filtered_scan_clauses = NIL;
+  List *fdw_scan_clauses = NIL;
 
   /*
    * Although we skip row blocks that are refuted by the WHERE clause, but
@@ -444,8 +506,44 @@ db721_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
    * that all non-related rows are filtered out. So we just put all of the
    * scanClauses into the plan node's qual list for the executor to check.
    */
-  scan_clauses = extract_actual_clauses(scan_clauses,
-                                        false); /* extract regular clauses */
+  actual_scan_clauses = extract_actual_clauses(scan_clauses,
+                                               false); /* extract regular clauses */
+  ListCell *lc;
+  foreach (lc, actual_scan_clauses)
+  {
+    Expr *clause = (Expr *)lfirst(lc);
+    OpExpr *expr;
+    Expr *left, *right;
+    if (IsA(clause, OpExpr))
+    {
+      expr = (OpExpr *)clause;
+      if (list_length(expr->args) == 2)
+      {
+        left = (Expr *)linitial(expr->args);
+        right = (Expr *)lsecond(expr->args);
+        /*
+         * Looking for expressions like "EXPR OP CONST" or "CONST OP EXPR"
+         */
+
+        if (IsA(left, RelabelType))
+        {
+          left = (((RelabelType *)left)->arg);
+        }
+        if (IsA(right, RelabelType))
+        {
+          right = (((RelabelType *)right)->arg);
+        }
+
+        if ((IsA(right, Const) && IsA(left, Var)) || (IsA(left, Const) && IsA(right, Var)))
+        {
+          fdw_scan_clauses = lappend(fdw_scan_clauses, clause);
+          continue;
+        }
+      }
+    }
+
+    filtered_scan_clauses = lappend(fdw_scan_clauses, clause);
+  }
 
   /*
    * As an optimization, we only read columns that are present in the query.
@@ -457,11 +555,11 @@ db721_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
   foreignPrivateList = list_make1(columnList);
 
   /* create the foreign scan node */
-  foreignScan = make_foreignscan(tlist, scan_clauses, baserel->relid,
+  foreignScan = make_foreignscan(tlist, filtered_scan_clauses, baserel->relid,
                                  NIL, /* no expressions to evaluate */
                                  foreignPrivateList,
                                  NIL,
-                                 NIL,
+                                 fdw_scan_clauses,
                                  NULL); /* no outer path */
 
   return foreignScan;
@@ -488,7 +586,7 @@ extern "C" void db721_BeginForeignScan(ForeignScanState *scanState, int eflags)
 
   foreignScan = (ForeignScan *)scanState->ss.ps.plan;
   foreignPrivateList = (List *)foreignScan->fdw_private;
-  whereClauseList = foreignScan->scan.plan.qual;
+  whereClauseList = foreignScan->fdw_recheck_quals;
 
   columnList = (List *)linitial(foreignPrivateList);
 
@@ -498,21 +596,201 @@ extern "C" void db721_BeginForeignScan(ForeignScanState *scanState, int eflags)
   scanState->fdw_state = (void *)readState;
 }
 
+bool evaluate_op(Oid opno, Datum left, Datum right, int type)
+{
+  if (type == TYPE_INT)
+  {
+    int left_int = DatumGetInt32(left);
+    int right_int = DatumGetInt32(right);
+    switch (opno)
+    {
+    case OP_INT_LT_L: // <
+      return left_int < right_int;
+    case OP_INT_LTE_L: // <=
+      return left_int <= right_int;
+    case OP_INT_EQ_L: // =
+      return left_int == right_int;
+    case OP_INT_GTE_L: // >=
+      return left_int >= right_int;
+    case OP_INT_GT_L: // >
+      return left_int > right_int;
+    case OP_INT_NEQ_L: // <>
+      return left_int != right_int;
+    default:
+      elog(ERROR, "unknown opno %u", opno);
+    }
+  }
+  else if (type == TYPE_FLOAT)
+  {
+    double left_float;
+    double right_float;
+
+    switch (opno)
+    {
+    case OP_FLOAT_LT_L:  // <
+    case OP_FLOAT_LTE_L: // <=
+    case OP_FLOAT_EQ_L:  // =
+    case OP_FLOAT_GTE_L: // >=
+    case OP_FLOAT_GT_L:  // >
+    case OP_FLOAT_NEQ_L: // <>
+      left_float = static_cast<double>(DatumGetFloat4(left));
+      right_float = DatumGetFloat8(right);
+      break;
+    case OP_FLOAT_LT_R:  // <
+    case OP_FLOAT_LTE_R: // <=
+    case OP_FLOAT_EQ_R:  // =
+    case OP_FLOAT_GTE_R: // >=
+    case OP_FLOAT_GT_R:  // >
+    case OP_FLOAT_NEQ_R: // <>
+      left_float = DatumGetFloat8(left);
+      right_float = static_cast<double>(DatumGetFloat4(right));
+      break;
+    default:
+      elog(ERROR, "unknown opno %u", opno);
+    }
+
+    switch (opno)
+    {
+    case OP_FLOAT_LT_L: // <
+    case OP_FLOAT_LT_R: // <
+      return left_float < right_float;
+    case OP_FLOAT_LTE_L: // <=
+    case OP_FLOAT_LTE_R: // <=
+      return left_float <= right_float;
+    case OP_FLOAT_EQ_L: // =
+    case OP_FLOAT_EQ_R: // =
+      return left_float == right_float;
+    case OP_FLOAT_GTE_L: // >=
+    case OP_FLOAT_GTE_R: // >=
+      return left_float >= right_float;
+    case OP_FLOAT_GT_L: // >
+    case OP_FLOAT_GT_R: // >
+      return left_float > right_float;
+    case OP_FLOAT_NEQ_L: // <>
+    case OP_FLOAT_NEQ_R: // <>
+      return left_float != right_float;
+    default:
+      elog(ERROR, "unknown opno %u", opno);
+    }
+  }
+  else if (type == TYPE_STR)
+  {
+    std::locale loc;
+    char *tl = DatumGetPointer(left);
+    char *tr = DatumGetPointer(right);
+    std::string left_text(VARDATA(tl), VARSIZE(tl) - VARHDRSZ);
+    std::string right_text(VARDATA(tr), VARSIZE(tr) - VARHDRSZ);
+    switch (opno)
+    {
+    case OP_STR_LT_L: // <
+      return loc(left_text, right_text);
+    case OP_STR_LTE_L: // <=
+      return left_text == right_text || loc(left_text, right_text);
+    case OP_STR_EQ_L: // =
+      return left_text == right_text;
+    case OP_STR_GTE_L: // >=
+      return left_text == right_text || loc(right_text, left_text);
+    case OP_STR_GT_L: // >
+      return loc(right_text, left_text);
+    case OP_STR_NEQ_L: // <>
+      return left_text != right_text;
+    default:
+      elog(ERROR, "unknown opno %u", opno);
+    }
+  }
+  else
+  {
+    elog(ERROR, "unknown type %d", type);
+  }
+}
+
+bool evaluate_where_clause(TableReadState *readState, Datum *columnValues, bool *columnNulls)
+{
+  List *whereClauseList = readState->whereClauseList;
+  ListCell *whereClauseCell = NULL;
+
+  foreach (whereClauseCell, whereClauseList)
+  {
+    Expr *whereClause = (Expr *)lfirst(whereClauseCell);
+
+    assert(IsA(whereClause, OpExpr));
+
+    OpExpr *expr = (OpExpr *)whereClause;
+    Expr *left = (Expr *)linitial(expr->args);
+    Expr *right = (Expr *)lsecond(expr->args);
+
+    if (IsA(left, RelabelType))
+    {
+      left = (((RelabelType *)left)->arg);
+    }
+    if (IsA(right, RelabelType))
+    {
+      right = (((RelabelType *)right)->arg);
+    }
+
+    Datum left_datum;
+    Datum right_datum;
+    uint32_t columnIndex;
+    int type;
+
+    if (IsA(left, Const) && IsA(right, Var))
+    {
+      left_datum = ((Const *)left)->constvalue;
+
+      columnIndex = ((Var *)right)->varattno - 1;
+      right_datum = columnValues[columnIndex];
+    }
+    else if (IsA(left, Var) && IsA(right, Const))
+    {
+      columnIndex = ((Var *)left)->varattno - 1;
+      left_datum = columnValues[columnIndex];
+
+      right_datum = ((Const *)right)->constvalue;
+    }
+    else
+    {
+      elog(ERROR, "unknown case");
+    }
+
+    if (columnNulls[columnIndex])
+    {
+      return false;
+    }
+
+    // get type
+    type = readState->blockBuffers[columnIndex].type;
+
+    if (!evaluate_op(expr->opno, left_datum, right_datum, type))
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool db721_ReadNextRow(TableReadState *readState, Datum *columnValues, bool *columnNulls)
 {
-  ListCell *projectedColumnCell = NULL;
-  foreach (projectedColumnCell, readState->projectedColumnList)
+  while (readState->blockNext < readState->blockSize)
   {
-    Var *projectedColumn = (Var *)lfirst(projectedColumnCell);
-    uint32 projectedColumnIndex = projectedColumn->varattno - 1;
-    columnValues[projectedColumnIndex] = readState->blockBuffers[projectedColumnIndex].values[readState->blockNext];
-    columnNulls[projectedColumnIndex] = false;
+    ListCell *projectedColumnCell = NULL;
+    foreach (projectedColumnCell, readState->projectedColumnList)
+    {
+      Var *projectedColumn = (Var *)lfirst(projectedColumnCell);
+      uint32 projectedColumnIndex = projectedColumn->varattno - 1;
+      columnValues[projectedColumnIndex] = readState->blockBuffers[projectedColumnIndex].values[readState->blockNext];
+      columnNulls[projectedColumnIndex] = false;
+    }
+
+    readState->blockNext++;
+    readState->overallRow++;
+
+    if (evaluate_where_clause(readState, columnValues, columnNulls))
+    {
+      return true;
+    }
   }
 
-  readState->blockNext++;
-  readState->overallRow++;
-
-  return true;
+  return false;
 }
 
 void fetch_more_data(ForeignScanState *scanState)
@@ -601,22 +879,22 @@ extern "C" TupleTableSlot *db721_IterateForeignScan(ForeignScanState *scanState)
 
   ExecClearTuple(tupleSlot);
 
-  if (readState->blockNext >= readState->blockSize)
+  do
   {
-    fetch_more_data(scanState);
-
     if (readState->blockNext >= readState->blockSize)
     {
-      return tupleSlot;
+      fetch_more_data(scanState);
+
+      if (readState->blockNext >= readState->blockSize)
+      {
+        return tupleSlot;
+      }
     }
-  }
 
-  nextRowFound = db721_ReadNextRow(readState, columnValues, columnNulls);
+    nextRowFound = db721_ReadNextRow(readState, columnValues, columnNulls);
+  } while (!nextRowFound);
 
-  if (nextRowFound)
-  {
-    ExecStoreVirtualTuple(tupleSlot);
-  }
+  ExecStoreVirtualTuple(tupleSlot);
 
   return tupleSlot;
 }
