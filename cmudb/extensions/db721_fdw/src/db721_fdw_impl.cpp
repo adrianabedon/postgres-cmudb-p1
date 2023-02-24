@@ -30,15 +30,6 @@ extern "C" {
 #define TYPE_FLOAT ((int)2)
 #define TYPE_STR ((int)3)
 
-/* 
-int
-= 
-> 
->=
-< 
-<=
-<>
-*/
 #define OP_INT_EQ_LR 96
 #define OP_INT_GT_LR 521
 #define OP_INT_GTE_LR 525
@@ -46,15 +37,6 @@ int
 #define OP_INT_LTE_LR 523
 #define OP_INT_NEQ_LR 518
 
-/*
-float
-=  
->  
->= 
-<  
-<= 
-<> 
-*/
 #define OP_FLOAT_EQ_L 1120
 #define OP_FLOAT_GT_L 1123
 #define OP_FLOAT_GTE_L 1125
@@ -69,15 +51,6 @@ float
 #define OP_FLOAT_LTE_R 1134
 #define OP_FLOAT_NEQ_R 1131
 
-/*
-str
-=  
->  
->= 
-<  
-<= 
-<> 
-*/
 #define OP_STR_EQ_LR 98
 #define OP_STR_GT_LR 666
 #define OP_STR_GTE_LR 667
