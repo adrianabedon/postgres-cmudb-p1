@@ -26,9 +26,9 @@ extern "C" {
 #include <sys/stat.h>
 }
 
-#define TYPE_INT 1
-#define TYPE_FLOAT 2
-#define TYPE_STR 3
+#define TYPE_INT ((int)1)
+#define TYPE_FLOAT ((int)2)
+#define TYPE_STR ((int)3)
 
 /* 
 int
@@ -121,6 +121,8 @@ typedef struct TableReadState
   uint32_t blockIndex;
   uint32_t blockSize;
   uint32_t blockNext;
+
+  uint32_t numBlocks;
 
   uint32_t overallRow;
 } TableReadState;
@@ -391,6 +393,8 @@ db721_BeginRead(const char *filename, TupleDesc tupleDescriptor,
   readstate->blockBuffers = (BlockBuffer *)palloc0(
       readstate->blockBufferCount * sizeof(BlockBuffer));
 
+  readstate->numBlocks = 0;
+
   uint32_t max_block_size = readstate->metadata["Max Values Per Block"].get<uint32_t>();
 
   ListCell *projectedColumnCell = NULL;
@@ -404,6 +408,7 @@ db721_BeginRead(const char *filename, TupleDesc tupleDescriptor,
     json column_metadata = readstate->metadata["Columns"][attr_name];
     std::string attr_type = column_metadata["type"].get<std::string>();
 
+    readstate->numBlocks = column_metadata["num_blocks"].get<int>();
     readstate->blockBuffers[projectedColumnIndex].values = (Datum *)palloc(max_block_size * sizeof(Datum));
 
     if (attr_type == "str")
@@ -779,12 +784,242 @@ bool db721_ReadNextRow(TableReadState *readState, Datum *columnValues, bool *col
   return false;
 }
 
+void build_cstring(char *src_str, char *dest_buffer)
+{
+  int len = strlen(src_str);
+  text *t = (text *)dest_buffer;
+  SET_VARSIZE(t, len + VARHDRSZ);
+  memcpy(VARDATA(t), src_str, len);
+}
+
+bool should_read_block(TableReadState *readState, uint32_t blockIndex)
+{
+  List *whereClauseList = readState->whereClauseList;
+  ListCell *whereClauseCell = NULL;
+
+  foreach (whereClauseCell, whereClauseList)
+  {
+    Expr *whereClause = (Expr *)lfirst(whereClauseCell);
+
+    assert(IsA(whereClause, OpExpr));
+
+    OpExpr *expr = (OpExpr *)whereClause;
+    Expr *left = (Expr *)linitial(expr->args);
+    Expr *right = (Expr *)lsecond(expr->args);
+    Oid opno = expr->opno;
+
+    if (opno == OP_INT_NEQ_LR || opno == OP_STR_NEQ_LR || opno == OP_FLOAT_NEQ_L || opno == OP_FLOAT_NEQ_R)
+    {
+      continue;
+    }
+
+    if (IsA(left, RelabelType))
+    {
+      left = (((RelabelType *)left)->arg);
+    }
+    if (IsA(right, RelabelType))
+    {
+      right = (((RelabelType *)right)->arg);
+    }
+
+    Datum const_datum;
+    int type;
+    uint32_t columnIndex;
+    if (IsA(left, Const) && IsA(right, Var))
+    {
+      const_datum = ((Const *)left)->constvalue;
+      columnIndex = ((Var *)right)->varattno - 1;
+    }
+    else if (IsA(left, Var) && IsA(right, Const))
+    {
+      const_datum = ((Const *)right)->constvalue;
+      columnIndex = ((Var *)left)->varattno - 1;
+    }
+    else
+    {
+      elog(ERROR, "unknown case");
+    }
+
+    // get type
+    type = readState->blockBuffers[columnIndex].type;
+
+    Form_pg_attribute attr = TupleDescAttr(readState->tupleDescriptor, columnIndex);
+    char *attr_name = NameStr(attr->attname);
+
+    json block_metadata = readState->metadata["Columns"][attr_name]["block_stats"][std::to_string(blockIndex)];
+    json min_val = block_metadata["min"];
+    json max_val = block_metadata["max"];
+
+    char min_buffer[STR_SIZE + VARHDRSZ];
+    char max_buffer[STR_SIZE + VARHDRSZ];
+    Datum min_datum;
+    Datum max_datum;
+
+    switch (type)
+    {
+    case TYPE_FLOAT:
+    {
+      float min_float = static_cast<float>(min_val.get<double>());
+      float max_float = static_cast<float>(max_val.get<double>());
+      min_datum = fetch_att(&min_float, true, INT_FLOAT_SIZE);
+      max_datum = fetch_att(&max_float, true, INT_FLOAT_SIZE);
+      break;
+    }
+    case TYPE_INT:
+    {
+      int min_int = min_val.get<int>();
+      int max_int = max_val.get<int>();
+      min_datum = fetch_att(&min_int, true, INT_FLOAT_SIZE);
+      max_datum = fetch_att(&max_int, true, INT_FLOAT_SIZE);
+      break;
+    }
+    case TYPE_STR:
+    {
+      std::string min_str = min_val.get<std::string>();
+      std::string max_str = max_val.get<std::string>();
+
+      build_cstring((char *)min_str.c_str(), min_buffer);
+      build_cstring((char *)max_str.c_str(), max_buffer);
+
+      min_datum = PointerGetDatum(min_buffer);
+      max_datum = PointerGetDatum(max_buffer);
+      break;
+    }
+    default:
+      elog(ERROR, "unknown type");
+    }
+
+    if (opno == OP_INT_EQ_LR || opno == OP_STR_EQ_LR || opno == OP_FLOAT_EQ_L || opno == OP_FLOAT_EQ_R)
+    {
+      Oid op_le;
+      Oid op_ge;
+
+      switch (opno)
+      {
+      case OP_INT_EQ_LR:
+        op_le = OP_INT_LTE_LR;
+        op_ge = OP_INT_GTE_LR;
+        break;
+      case OP_STR_EQ_LR:
+        op_le = OP_STR_LTE_LR;
+        op_ge = OP_STR_GTE_LR;
+        break;
+      case OP_FLOAT_EQ_L:
+      case OP_FLOAT_EQ_R:
+        op_le = OP_FLOAT_LTE_L;
+        op_ge = OP_FLOAT_GTE_L;
+        break;
+      default:
+        elog(ERROR, "unknown case");
+      }
+
+      if (!(evaluate_op(op_le, min_datum, const_datum, type) && evaluate_op(op_ge, max_datum, const_datum, type)))
+      {
+        return false;
+      }
+      continue;
+    }
+
+    Datum left_datum;
+    Datum right_datum;
+
+    if (IsA(left, Const) && IsA(right, Var))
+    {
+      left_datum = ((Const *)left)->constvalue;
+      switch (opno)
+      {
+      case OP_INT_LT_LR:
+      case OP_INT_LTE_LR:
+      case OP_STR_LT_LR:
+      case OP_STR_LTE_LR:
+      case OP_FLOAT_LT_R:
+      case OP_FLOAT_LTE_R:
+        right_datum = max_datum;
+        break;
+      case OP_INT_GT_LR:
+      case OP_INT_GTE_LR:
+      case OP_STR_GT_LR:
+      case OP_STR_GTE_LR:
+      case OP_FLOAT_GT_R:
+      case OP_FLOAT_GTE_R:
+        right_datum = min_datum;
+        break;
+      default:
+        elog(ERROR, "unknown case");
+      }
+    }
+    else if (IsA(left, Var) && IsA(right, Const))
+    {
+      right_datum = ((Const *)right)->constvalue;
+      switch (opno)
+      {
+      case OP_INT_LT_LR:
+      case OP_INT_LTE_LR:
+      case OP_STR_LT_LR:
+      case OP_STR_LTE_LR:
+      case OP_FLOAT_LT_L:
+      case OP_FLOAT_LTE_L:
+        left_datum = min_datum;
+        break;
+      case OP_INT_GT_LR:
+      case OP_INT_GTE_LR:
+      case OP_STR_GT_LR:
+      case OP_STR_GTE_LR:
+      case OP_FLOAT_GT_L:
+      case OP_FLOAT_GTE_L:
+        left_datum = max_datum;
+        break;
+      default:
+        elog(ERROR, "unknown case");
+      }
+    }
+    else
+    {
+      elog(ERROR, "unknown case");
+    }
+
+    if (!evaluate_op(opno, left_datum, right_datum, type))
+    {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 void fetch_more_data(ForeignScanState *scanState)
 {
   TableReadState *readState = (TableReadState *)scanState->fdw_state;
   assert(readState->blockNext >= readState->blockSize);
   ListCell *projectedColumnCell = NULL;
-  readState->blockIndex = readState->blockIndex == UINT32_MAX ? 0 : readState->blockIndex + 1;
+
+  json some_col_block_stats = (readState->metadata["Columns"].begin()).value()["block_stats"];
+  int values_in_block;
+
+  bool block_pass = false;
+  do
+  {
+    readState->blockIndex++;
+    // make sure there is a still a block to read
+    if (readState->blockIndex >= readState->numBlocks)
+    {
+      readState->blockSize = 0;
+      readState->blockNext = 0;
+      return;
+    }
+
+    values_in_block = some_col_block_stats[std::to_string(readState->blockIndex)]["num"].get<int>();
+
+    // check all conditions on block
+    block_pass = should_read_block(readState, readState->blockIndex);
+    if (!block_pass)
+    {
+      readState->overallRow += values_in_block;
+    }
+  } while (!block_pass);
+
+  readState->blockSize = values_in_block;
+  readState->blockNext = 0;
 
   foreach (projectedColumnCell, readState->projectedColumnList)
   {
@@ -797,19 +1032,6 @@ void fetch_more_data(ForeignScanState *scanState)
     json column_metadata = readState->metadata["Columns"][attr_name];
     std::string attr_type = column_metadata["type"].get<std::string>();
     int start_offset = column_metadata["start_offset"].get<int>();
-    int num_blocks = column_metadata["num_blocks"].get<int>();
-
-    if (readState->blockIndex >= (uint32_t)num_blocks)
-    {
-      readState->blockSize = 0;
-      readState->blockNext = 0;
-      return;
-    }
-
-    int values_in_block = column_metadata["block_stats"][std::to_string(readState->blockIndex)]["num"].get<int>();
-
-    readState->blockSize = values_in_block;
-    readState->blockNext = 0;
 
     Datum *datumArray = readState->blockBuffers[projectedColumnIndex].values;
 
@@ -822,12 +1044,9 @@ void fetch_more_data(ForeignScanState *scanState)
       for (int i = 0; i < values_in_block; i++)
       {
         char *str = datumBuffer->data + i * STR_SIZE;
-        int len = strlen(str);
-        text *t = (text *)(valueBuffer + i * (STR_SIZE + VARHDRSZ));
-        SET_VARSIZE(t, len + VARHDRSZ);
-        memcpy(VARDATA(t), str, len);
-        datumArray[i] = fetch_att((char *)t, false,
-                                  STR_SIZE);
+        char *dest_buffer = valueBuffer + i * (STR_SIZE + VARHDRSZ);
+        build_cstring(str, dest_buffer);
+        datumArray[i] = PointerGetDatum(dest_buffer);
       }
 
       pfree(datumBuffer->data);
@@ -876,7 +1095,6 @@ extern "C" TupleTableSlot *db721_IterateForeignScan(ForeignScanState *scanState)
         return tupleSlot;
       }
     }
-
     nextRowFound = db721_ReadNextRow(readState, columnValues, columnNulls);
   } while (!nextRowFound);
 
